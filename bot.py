@@ -1,22 +1,48 @@
+from dotenv import load_dotenv
+load_dotenv()
 import telebot
 from openai import OpenAI
 import os
 import json
 import re
+import html
 from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ORCAROUTER_API_KEY = os.getenv("ORCAROUTER_API_KEY")
+ATRIA_API_KEY = os.getenv("ATRIA_API_KEY")
 
-if not TELEGRAM_TOKEN or not ORCAROUTER_API_KEY:
-    raise ValueError("TELEGRAM_TOKEN и ORCAROUTER_API_KEY должны быть установлены")
+if not TELEGRAM_TOKEN or not ATRIA_API_KEY:
+    raise ValueError("TELEGRAM_TOKEN и ATRIA_API_KEY должны быть установлены")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = OpenAI(
-    base_url="https://api.orcarouter.ai/v1",
-    api_key=ORCAROUTER_API_KEY,
+    base_url="https://api.atria-asi.ai/v1",
+    api_key=ATRIA_API_KEY,
     http_client=None
 )
+
+def escape_html(text: str) -> str:
+    """Экранирует спецсимволы HTML, кроме уже расставленных тегов модели."""
+    if not text:
+        return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def safe_send(chat_id, text, reply_to=None, parse_mode="HTML"):
+    """Отправка с автоматическим откатом на plain text при ошибке парсинга."""
+    try:
+        if reply_to:
+            bot.reply_to(reply_to, text, parse_mode=parse_mode)
+        else:
+            bot.send_message(chat_id, text, parse_mode=parse_mode)
+    except Exception as e:
+        print(f"HTML parse error, fallback to plain: {e}")
+        plain = re.sub(r"<[^>]+>", "", text)
+        plain = html.unescape(plain)
+        if reply_to:
+            bot.reply_to(reply_to, plain)
+        else:
+            bot.send_message(chat_id, plain)
+
 # Prompt
 def load_system_prompt():
     prompt_file = "system_prompt.txt"
@@ -85,13 +111,13 @@ def get_chat_history(user_id, limit=10):
 def send_welcome(message):
     user_id = str(message.from_user.id)
     name = get_user_name(user_id)
-    
+
     if name:
-        welcome = f"Здравствуйте, {name}. Чем могу помочь?"
+        welcome = f"Здравствуйте, <b>{escape_html(name)}</b>. Чем могу помочь?"
     else:
         welcome = "Здравствуйте. Представьтесь, пожалуйста. Как мне к Вам обращаться?"
-    
-    bot.reply_to(message, welcome)
+
+    safe_send(message.chat.id, welcome, reply_to=message)
 
 @bot.message_handler(commands=['clear'])
 def clear_history(message):
@@ -99,76 +125,89 @@ def clear_history(message):
     context = get_user_context(user_id)
     context["history"] = []
     save_user_data(user_data)
-    bot.reply_to(message, "История очищена.")
+    safe_send(message.chat.id, "История очищена.", reply_to=message)
 
 @bot.message_handler(commands=['name'])
 def change_name(message):
     user_id = str(message.from_user.id)
     parts = message.text.split(maxsplit=1)
-    
+
     if len(parts) < 2:
-        bot.reply_to(message, "Укажите имя после команды. Пример: /name Александр")
+        safe_send(message.chat.id, "Укажите имя после команды. Пример: /name Александр", reply_to=message)
         return
-    
+
     new_name = parts[1].strip()
     set_user_name(user_id, new_name)
-    bot.reply_to(message, f"Имя сохранено. Здравствуйте, {new_name}.")
+    safe_send(message.chat.id, f"Имя сохранено. Здравствуйте, <b>{escape_html(new_name)}</b>.", reply_to=message)
 
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_id = str(message.from_user.id)
+
+    if not message.text:
+        safe_send(message.chat.id, "Принимаю только текстовые сообщения.", reply_to=message)
+        return
+
     user_text = message.text
-    
+
     bot.send_chat_action(message.chat.id, 'typing')
-    
+
     try:
         context = get_user_context(user_id)
         name = context.get("name")
-        
+
         # Name checking
         if not name:
             name_match = re.search(r'(?:меня зовут|зовут|я\s+)([А-Яа-яёЁA-Za-z\-]+)', user_text, re.IGNORECASE)
             if name_match:
                 name = name_match.group(1).capitalize()
                 set_user_name(user_id, name)
-                bot.reply_to(
-                    message,
-                    f"Принял. {name}, чем могу Вам помочь?"
+                safe_send(
+                    message.chat.id,
+                    f"Принял. <b>{escape_html(name)}</b>, чем могу Вам помочь?",
+                    reply_to=message
                 )
                 return
             else:
-                bot.reply_to(
-                    message,
-                    "Представьтесь, пожалуйста. Напишите 'Меня зовут [имя]' или используйте команду /name [имя]"
+                safe_send(
+                    message.chat.id,
+                    "Представьтесь, пожалуйста. Напишите 'Меня зовут [имя]' или используйте команду /name [имя]",
+                    reply_to=message
                 )
                 return
-        
+
         save_chat_history(user_id, "user", user_text)
         system_prompt_with_name = SYSTEM_PROMPT + f"\n\nИМЯ ПОЛЬЗОВАТЕЛЯ: {name}"
-        
+
         messages = [{"role": "system", "content": system_prompt_with_name}]
-        
-        history = get_chat_history(user_id, 10)
+
+        history = get_chat_history(user_id, 3)
         for msg in history:
             messages.append({"role": msg["role"], "content": msg["content"]})
-        
+
         messages.append({"role": "user", "content": user_text})
-        
+
         response = client.chat.completions.create(
-            model="deepseek/deepseek-v4-pro-free",
+            model="Atria-Dawn-Preview",
             messages=messages,
-            temperature=0.5,
-            max_tokens=2000
+            temperature=0.3,
+            max_tokens=1000
         )
-        
+        if response.usage:
+            print(f"TOKENS: prompt={response.usage.prompt_tokens} "
+                  f"completion={response.usage.completion_tokens} "
+                  f"total={response.usage.total_tokens}")
+        else:
+            print("TOKENS: usage не вернулся провайдером")
+
         bot_reply = response.choices[0].message.content
         save_chat_history(user_id, "assistant", bot_reply)
-        bot.reply_to(message, bot_reply)
-        
+        safe_send(message.chat.id, bot_reply, reply_to=message)
+
     except Exception as e:
         print(f"Ошибка: {e}")
-        bot.reply_to(message, f"Ошибка: {str(e)[:100]}")
+        safe_send(message.chat.id, f"Ошибка: {escape_html(str(e)[:100])}", reply_to=message)
 
 print("Деловой ассистент запущен.")
 bot.infinity_polling()
